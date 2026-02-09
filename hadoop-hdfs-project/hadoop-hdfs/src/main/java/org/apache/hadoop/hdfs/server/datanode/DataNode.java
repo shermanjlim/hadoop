@@ -611,6 +611,9 @@ public class DataNode extends ReconfigurableBase
           DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_DEFAULT);
       this.dingoClient = new DingoClient(dingoServerAddress);
       LOG.info("Dingo client initialized with server address: {}", dingoServerAddress);
+      // TODO: remove this - for testing only
+      this.dingoClient.declare(5, () -> LOG.info("Dingo client connected well!!!"));
+      this.dingoClient.declare(3, () -> LOG.info("Dingo client connected"));
       // ------------------ Dingo Integration ------------------
     } catch (IOException ie) {
       shutdown();
