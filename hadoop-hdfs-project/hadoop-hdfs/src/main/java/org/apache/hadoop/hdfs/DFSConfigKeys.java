@@ -40,6 +40,11 @@ import java.util.concurrent.TimeUnit;
  */
 @InterfaceAudience.Private
 public class DFSConfigKeys extends CommonConfigurationKeys {
+  // ------------------ Dingo Integration ------------------
+  public static final String  DFS_DINGO_SERVER_ADDRESS_KEY = "dfs.dingo.server.address";
+  public static final String  DFS_DINGO_SERVER_ADDRESS_DEFAULT = "localhost:50051";
+  // ------------------ Dingo Integration ------------------
+    
   public static final String  DFS_BLOCK_SIZE_KEY =
       HdfsClientConfigKeys.DFS_BLOCK_SIZE_KEY;
   public static final long    DFS_BLOCK_SIZE_DEFAULT =

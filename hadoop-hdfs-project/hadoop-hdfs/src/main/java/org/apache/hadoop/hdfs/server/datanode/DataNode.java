@@ -107,6 +107,13 @@ import org.apache.hadoop.fs.GetSpaceUsed;
 import org.apache.hadoop.fs.WindowsGetSpaceUsed;
 import org.apache.hadoop.hdfs.protocol.proto.ReconfigurationProtocolProtos.ReconfigurationProtocolService;
 
+// ------------------ Dingo Integration ------------------
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_DEFAULT;
+
+import dingo.DingoClient;
+// ------------------ Dingo Integration ------------------
+
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
@@ -492,6 +499,10 @@ public class DataNode extends ReconfigurableBase
 
   private DataTransferThrottler ecReconstuctReadThrottler;
   private DataTransferThrottler ecReconstuctWriteThrottler;
+  
+  // ------------------ Dingo Integration ------------------
+  public DingoClient dingoClient;
+  // ------------------ Dingo Integration ------------------  
 
   /**
    * Creates a dummy DataNode for testing purpose.
@@ -522,6 +533,9 @@ public class DataNode extends ReconfigurableBase
         DFSConfigKeys.DFS_PIPELINE_CONGESTION_RATIO_DEFAULT);
     this.congestionRatio = congestionRationTmp > 0 ?
         congestionRationTmp : DFSConfigKeys.DFS_PIPELINE_CONGESTION_RATIO_DEFAULT;
+    // ------------------ Dingo Integration ------------------
+    this.dingoClient = null;
+    // ------------------ Dingo Integration ------------------
   }
 
   /**
@@ -590,6 +604,14 @@ public class DataNode extends ReconfigurableBase
       hostName = getHostName(conf);
       LOG.info("Configured hostname is {}", hostName);
       startDataNode(dataDirs, resources);
+
+      // ------------------ Dingo Integration ------------------
+      String dingoServerAddress = conf.get(
+          DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_KEY,
+          DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_DEFAULT);
+      this.dingoClient = new DingoClient(dingoServerAddress);
+      LOG.info("Dingo client initialized with server address: {}", dingoServerAddress);
+      // ------------------ Dingo Integration ------------------
     } catch (IOException ie) {
       shutdown();
       throw ie;
@@ -2585,6 +2607,17 @@ public class DataNode extends ReconfigurableBase
     if (pauseMonitor != null) {
       pauseMonitor.stop();
     }
+
+    // ------------------ Dingo Integration ------------------
+    if (dingoClient != null) {
+      try {
+        dingoClient.close();
+        LOG.info("Dingo client shutdown successfully");
+      } catch (Exception e) {
+        LOG.warn("Exception shutting down Dingo client", e);
+      }
+    }
+    // ------------------ Dingo Integration ------------------
 
     // shouldRun is set to false here to prevent certain threads from exiting
     // before the restart prep is done.
