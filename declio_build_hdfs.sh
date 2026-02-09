@@ -3,6 +3,9 @@
 
 set -e
 
+export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+export PATH=$JAVA_HOME/bin:$PATH
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HADOOP_ROOT="${HADOOP_ROOT:-$SCRIPT_DIR}"
 DIST_DIR=$(find "$HADOOP_ROOT/hadoop-dist/target" -maxdepth 1 -type d -name "hadoop-*" | head -n 1)

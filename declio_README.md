@@ -14,7 +14,7 @@ First, build the Dingo client and install it to your local Maven repository:
 
 ```bash
 cd /path/to/dingo/dingo_client_java
-mvn clean install -DskipTests
+./build.sh
 ```
 
 ### 2. Add Dependency to Hadoop HDFS
@@ -31,22 +31,11 @@ The Dingo client dependency has already been added to the Hadoop HDFS `pom.xml`:
 </dependency>
 ```
 
-### 3. Verify the Integration
+### 3. Build the Complete Hadoop Distribution
 
-Build the Hadoop HDFS module to verify the integration:
-
-```bash
-cd /path/to/hadoop/hadoop-hdfs-project/hadoop-hdfs
-mvn clean compile -DskipTests
-```
-
-If the build succeeds, the integration is complete.
-
-### 4. Build the Complete HDFS Package
-
-To build the complete HDFS package with the Dingo client included:
+To build the complete hadoop distribution with the Dingo client included:
 
 ```bash
-cd /path/to/hadoop/hadoop-hdfs-project/hadoop-hdfs
-mvn clean package -DskipTests
+cd /path/to/hadoop/
+./declio_build_hadoop.sh --clean
 ```
