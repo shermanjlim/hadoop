@@ -111,6 +111,7 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_DEFAULT;
 
 import dingo.DingoClient;
+import dingo.DeclarationProto;
 // ------------------ Dingo Integration ------------------
 
 import javax.management.ObjectName;
@@ -120,9 +121,11 @@ import java.io.PrintStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.security.PrivilegedExceptionAction;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.TreeSet;
@@ -1193,8 +1196,17 @@ public class NameNode extends ReconfigurableBase implements
     this.dingoClient = new DingoClient(dingoServerAddress);
     LOG.info("Dingo client initialized with server address: {}", dingoServerAddress);
     // TODO: remove this - for testing only
-    this.dingoClient.declare(5, () -> LOG.info("Dingo client connected well!!!"));
-    this.dingoClient.declare(3, () -> LOG.info("Dingo client connected"));
+    this.dingoClient.declare(
+        Arrays.asList(
+            new HashSet<>(Arrays.asList(new dingo.Block(1, "node_a"), new dingo.Block(2, "node_b"))),
+            new HashSet<>(Arrays.asList(new dingo.Block(3, "node_c"), new dingo.Block(4, "node_d")))),
+        2,
+        Instant.now().getEpochSecond() + 3,
+        DeclarationProto.MaintenanceType.MAINTENANCE_TYPE_UNSPECIFIED,
+        blockSets -> {
+          LOG.info("Dingo client connected!");
+          LOG.info(dingo.Block.formatBlockSets(blockSets));
+        });
     // ------------------ Dingo Integration ------------------
 
     DefaultMetricsSystem.instance().register(this);
