@@ -506,7 +506,8 @@ public class DataNode extends ReconfigurableBase
   
   // ------------------ Dingo Integration ------------------
   public DingoClient dingoClient;
-  // ------------------ Dingo Integration ------------------  
+  public ConcurrentHashMap<String, Set<ExtendedBlock>> declareScrubQueue;
+  // ------------------ Dingo Integration ------------------
 
   /**
    * Creates a dummy DataNode for testing purpose.
@@ -539,6 +540,7 @@ public class DataNode extends ReconfigurableBase
         congestionRationTmp : DFSConfigKeys.DFS_PIPELINE_CONGESTION_RATIO_DEFAULT;
     // ------------------ Dingo Integration ------------------
     this.dingoClient = null;
+    this.declareScrubQueue = new ConcurrentHashMap<String, Set<ExtendedBlock>>();
     // ------------------ Dingo Integration ------------------
   }
 
@@ -615,18 +617,7 @@ public class DataNode extends ReconfigurableBase
           DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_DEFAULT);
       this.dingoClient = new DingoClient(dingoServerAddress);
       LOG.info("Dingo client initialized with server address: {}", dingoServerAddress);
-      // TODO: remove this - for testing only
-      this.dingoClient.declare(
-          Arrays.asList(
-              new HashSet<>(Arrays.asList(new dingo.Block(1, "node_a"), new dingo.Block(2, "node_b"))),
-              new HashSet<>(Arrays.asList(new dingo.Block(3, "node_c"), new dingo.Block(4, "node_d")))),
-          2,
-          Instant.now().getEpochSecond() + 3,
-          DeclarationProto.MaintenanceType.MAINTENANCE_TYPE_UNSPECIFIED,
-          blockSets -> {
-            LOG.info("Dingo client connected!");
-            LOG.info(dingo.Block.formatBlockSets(blockSets));
-          });
+      this.declareScrubQueue = new ConcurrentHashMap<String, Set<ExtendedBlock>>();
       // ------------------ Dingo Integration ------------------
     } catch (IOException ie) {
       shutdown();
@@ -1163,6 +1154,41 @@ public class DataNode extends ReconfigurableBase
   public FileIoProvider getFileIoProvider() {
     return fileIoProvider;
   }
+
+  // ------------------ Dingo Integration: Queue Management ------------------
+  /**
+   * Adds blocks to the declareScrubQueue for SCRUBBING declarations to Dingo.
+   * Thread-safe for concurrent access from multiple threads.
+   *
+   * @param storageID The storage ID (volume ID) containing the block
+   * @param block The block to be scrubbed
+   */
+  public void addToScrubQueue(String storageID, ExtendedBlock block) {
+    declareScrubQueue.compute(storageID, (k, v) -> {
+      if (v == null) v = ConcurrentHashMap.newKeySet();
+      v.add(block);
+      return v;
+    });
+  }
+
+  /**
+   * Atomically retrieves and resets the declareScrubQueue.
+   * @return The current declareScrubQueue contents, declareScrubQueue is reset to empty
+   */
+  public Map<String, Set<ExtendedBlock>> getAndResetScrubQueue() {
+    ConcurrentHashMap<String, Set<ExtendedBlock>> oldQueue = this.declareScrubQueue;
+    this.declareScrubQueue = new ConcurrentHashMap<>();
+    return oldQueue;
+  }
+
+  /**
+   * Triggers scrubbing for scheduled blocks via BlockScanner.
+   * @param blocksByStorage Map of storage IDs to sets of blocks to scrub
+   */
+  public void triggerScrub(String storageId, Set<ExtendedBlock> scheduledBlocks) {
+    blockScanner.triggerScrub(storageId, scheduledBlocks);
+  }
+  // ------------------ Dingo Integration: Queue Management ------------------
 
   /**
    * Contains the StorageLocations for changed data volumes.
@@ -4383,6 +4409,32 @@ public class DataNode extends ReconfigurableBase
     }
     return volumeInfoList;
   }
+  
+  public List<DatanodeVolumeInfo> getVolumeReportInternal() {
+    if (data == null) {
+      LOG.warn("Storage not yet initialized");
+      return new ArrayList<>(); 
+    }
+    Map<String, Object> volumeInfoMap = data.getVolumeInfoMap();
+    if (volumeInfoMap == null) {
+      LOG.warn("DataNode volume info not available.");
+      return new ArrayList<>(0);
+    }
+    List<DatanodeVolumeInfo> volumeInfoList = new ArrayList<>();
+    for (Entry<String, Object> volume : volumeInfoMap.entrySet()) {
+      @SuppressWarnings("unchecked")
+      Map<String, Object> volumeInfo = (Map<String, Object>) volume.getValue();
+      DatanodeVolumeInfo dnStorageInfo = new DatanodeVolumeInfo(
+          volume.getKey(), (Long) volumeInfo.get("usedSpace"),
+          (Long) volumeInfo.get("freeSpace"),
+          (Long) volumeInfo.get("reservedSpace"),
+          (Long) volumeInfo.get("reservedSpaceForReplicas"),
+          (Long) volumeInfo.get("numBlocks"),
+          (StorageType) volumeInfo.get("storageType"));
+      volumeInfoList.add(dnStorageInfo);
+    }
+    return volumeInfoList;
+  }  
 
   @VisibleForTesting
   public DiskBalancer getDiskBalancer() throws IOException {

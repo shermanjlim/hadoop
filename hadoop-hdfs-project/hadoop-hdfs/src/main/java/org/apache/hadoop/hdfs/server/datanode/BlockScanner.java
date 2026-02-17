@@ -28,7 +28,9 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_SCAN_PERIOD_HOUR
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_SCAN_PERIOD_HOURS_DEFAULT;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
@@ -372,6 +374,27 @@ public class BlockScanner {
     }
     scanner.markSuspectBlock(block);
   }
+
+  // ------------------ Dingo Integration ------------------
+  /**
+   * Triggers scrubbing for blocks scheduled by Dingo.
+   * Calls VolumeScanner.scanBlocks to perform actual block scanning.
+   *
+   * @param storageId The storage ID
+   * @param scheduledBlocks The set of blocks to scrub
+   */
+  public synchronized void triggerScrub(String storageId, Set<ExtendedBlock> scheduledBlocks) {
+    LOG.info("Scrubbing triggered from Dingo for storage id {} with {} blocks",
+        storageId, scheduledBlocks.size());
+
+    VolumeScanner scanner = scanners.get(storageId);
+    if (scanner != null) {
+      scanner.scanBlocks(scheduledBlocks);
+    } else {
+      LOG.warn("No scanner found for storage id {}", storageId);
+    }
+  }
+  // ------------------ Dingo Integration ------------------
 
   public long getJoinVolumeScannersTimeOutMs() {
     return joinVolumeScannersTimeOutMs;

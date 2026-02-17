@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.classification.VisibleForTesting;
@@ -36,6 +37,7 @@ import org.apache.hadoop.thirdparty.com.google.common.cache.Cache;
 import org.apache.hadoop.thirdparty.com.google.common.cache.CacheBuilder;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.BlockLocalPathInfo;
+import org.apache.hadoop.hdfs.protocol.DatanodeVolumeInfo;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.server.datanode.BlockScanner.Conf;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeReference;
@@ -457,6 +459,33 @@ public class VolumeScanner extends Thread {
     return -1;
   }
 
+  // ------------------ Dingo Integration ------------------
+  /**
+   * Scan a set of blocks scheduled by Dingo.
+   * This is called via the Dingo callback when blocks are scheduled for scrubbing.
+   *
+   * @param scheduledBlocks The set of blocks to scan
+   */
+  public void scanBlocks(Set<ExtendedBlock> scheduledBlocks) {
+    LOG.info("[VolumeScanner] starting a scan of {} blocks from Dingo callback",
+        scheduledBlocks.size());
+
+    int scannedCount = 0;
+    for (ExtendedBlock block : scheduledBlocks) {
+      try {
+        LOG.info("[VolumeScanner] scanning block {} from Dingo", block.getBlockId());
+        scanBlock(block, conf.targetBytesPerSec);
+        scannedCount++;
+      } catch (Exception e) {
+        LOG.error("[VolumeScanner] error scanning block {} from Dingo", block.getBlockId(), e);
+      }
+    }
+
+    LOG.info("[VolumeScanner] finished scanning {} of {} blocks from Dingo callback",
+        scannedCount, scheduledBlocks.size());
+  }
+  // ------------------ Dingo Integration ------------------
+
   @VisibleForTesting
   static boolean calculateShouldScan(String storageId, long targetBytesPerSec,
                    long scannedBytesSum, long startMinute, long curMinute) {
@@ -548,7 +577,8 @@ public class VolumeScanner extends Thread {
           scannedBytesSum, startMinute, curMinute)) {
         // If neededBytesPerSec is too low, then wait few seconds for some old
         // scannedBytes records to expire.
-        return 30000L;
+        // return 30000L;
+        return 3000L;
       }
 
       if (suspectBlock != null) {
@@ -585,36 +615,13 @@ public class VolumeScanner extends Thread {
           saveBlockIterator(curBlockIter);
         }
       }
-      bytesScanned = scanBlock(block, conf.targetBytesPerSec);
-      if (bytesScanned >= 0) {
-        scannedBytesSum += bytesScanned;
-        scannedBytes[(int)(curMinute % MINUTES_PER_HOUR)] += bytesScanned;
-      } else {
-        scanError = true;
-      }
+      // ------------------ Dingo Integration ------------------
+      // Instead of scanning directly, add block to queue for Dingo declaration
+      LOG.info("Block {} has been added to the scrub queue", block.getBlockId());
+      datanode.addToScrubQueue(volume.getStorageID(), block);
+      // ------------------ Dingo Integration ------------------
       return 0L;
     } finally {
-      synchronized (stats) {
-        stats.bytesScannedInPastHour = scannedBytesSum;
-        if (bytesScanned > 0) {
-          stats.blocksScannedInCurrentPeriod++;
-          stats.blocksScannedSinceRestart++;
-        }
-        if (scanError) {
-          stats.scanErrorsSinceRestart++;
-        }
-        if (block != null) {
-          stats.lastBlockScanned = block;
-        }
-        if (curBlockIter == null) {
-          stats.eof = true;
-          stats.blockPoolPeriodEndsMs = -1;
-        } else {
-          stats.eof = curBlockIter.atEnd();
-          stats.blockPoolPeriodEndsMs =
-              curBlockIter.getIterStartMs() + conf.scanPeriodMs;
-        }
-      }
     }
   }
 
@@ -634,6 +641,30 @@ public class VolumeScanner extends Thread {
 
   @Override
   public void run() {
+    long SCRUBBING_DELAY_BLOCKS = 3;
+    try {
+      LOG.info("[VolumeScanner] starting volume scanner");
+      // TODO: assuming one volume per datanode at the moment.
+      List<DatanodeVolumeInfo> reports = datanode.getVolumeReportInternal();
+      LOG.info("[VolumeScanner] found {} reports", reports.size());
+      DatanodeVolumeInfo dvi = reports.isEmpty() ? null : datanode.getVolumeReport().get(0);
+      LOG.info("[VolumeScanner] scanner waiting to get to {} blocks", SCRUBBING_DELAY_BLOCKS);
+      long numBlocks = dvi != null ? dvi.getNumBlocks() : 0;
+      while (numBlocks < SCRUBBING_DELAY_BLOCKS) {
+        LOG.info("[VolumeScanner] volume has {} blocks, waiting to get to {}", numBlocks, SCRUBBING_DELAY_BLOCKS);
+        sleep(5 * 1000);
+        reports = datanode.getVolumeReport();
+        LOG.info("[VolumeScanner] found {} reports", reports.size());
+        dvi = reports.isEmpty() ? null : datanode.getVolumeReport().get(0);
+        numBlocks = dvi != null ? dvi.getNumBlocks() : 0;
+      }
+      LOG.info("[VolumeScanner] volume has {} blocks", numBlocks);
+    } catch (InterruptedException ie) {
+      LOG.info("[VolumeScanner] scrubbing delay interrupted!");
+    } catch (IOException ioe) {
+      LOG.error("[VolumeScanner] scrubbing delay, error getting number of blocks! ", ioe);
+    }
+    LOG.info("[VolumeScanner] started");
     // Record the minute on which the scanner started.
     this.startMinute =
         TimeUnit.MINUTES.convert(Time.monotonicNow(), TimeUnit.MILLISECONDS);

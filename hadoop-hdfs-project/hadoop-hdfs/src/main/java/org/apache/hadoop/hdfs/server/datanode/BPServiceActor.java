@@ -80,6 +80,18 @@ import org.slf4j.Logger;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.thirdparty.com.google.common.base.Joiner;
 
+// ------------------ Dingo Integration ------------------
+import dingo.Block;
+import dingo.DeclarationProto;
+import java.time.Instant;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DECLARATIVE_SCRUBBING_DEADLINE_SECONDS_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DECLARATIVE_SCRUBBING_DEADLINE_SECONDS_DEFAULT;
+// ------------------ Dingo Integration ------------------
+
 /**
  * A thread per active or standby namenode to perform:
  * <ul>
@@ -121,6 +133,11 @@ class BPServiceActor implements Runnable {
       Collections.synchronizedSortedSet(new TreeSet<>());
   private final int maxDataLength;
 
+  // ------------------ Dingo Integration ------------------
+  private final long scrubbingDeadlineSeconds;
+  private final ExecutorService scrubbingExecutorService;
+  // ------------------ Dingo Integration ------------------
+
   private final IncrementalBlockReportManager ibrManager;
 
   private DatanodeRegistration bpRegistration;
@@ -156,6 +173,14 @@ class BPServiceActor implements Runnable {
     }
     commandProcessingThread = new CommandProcessingThread(this);
     commandProcessingThread.start();
+
+    // ------------------ Dingo Integration ------------------
+    scrubbingExecutorService = Executors.newFixedThreadPool(3);
+    scrubbingDeadlineSeconds = dn.getConf().getLong(
+        DECLARATIVE_SCRUBBING_DEADLINE_SECONDS_KEY,
+        DECLARATIVE_SCRUBBING_DEADLINE_SECONDS_DEFAULT);
+    LOG.info("Dingo SCRUBBING deadline configured to {} seconds", scrubbingDeadlineSeconds);
+    // ------------------ Dingo Integration ------------------
   }
 
   public DatanodeRegistration getBpRegistration() {
@@ -572,6 +597,11 @@ class BPServiceActor implements Runnable {
         slowPeers,
         slowDisks);
 
+    // ------------------ Dingo Integration ------------------
+    // Send SCRUBBING declarations to Dingo on heartbeat schedule
+    sendDingoScrubDeclarations();
+    // ------------------ Dingo Integration ------------------        
+
     scheduler.updateLastHeartbeatResponseTime(monotonicNow());
 
     if (outliersReportDue) {
@@ -581,6 +611,105 @@ class BPServiceActor implements Runnable {
 
     return response;
   }
+
+  // ------------------ Dingo Integration ------------------
+  /**
+   * Sends SCRUBBING declarations to Dingo server.
+   * One declaration per storageID, each with exactly 1 block set.
+   * Matches hdfs-declarative-io pattern of one DeclareIOBlocksRequestProto per storageID.
+   */
+  private void sendDingoScrubDeclarations() {
+    Map<String, Set<ExtendedBlock>> scrubQueue = dn.getAndResetScrubQueue();
+    if (scrubQueue.isEmpty()) {
+      LOG.debug("No blocks to declare to Dingo");
+      return;
+    }
+
+    String datanodeUuid = dn.getDatanodeUuid();
+    long deadline = Instant.now().getEpochSecond() + scrubbingDeadlineSeconds;
+
+    for (Map.Entry<String, Set<ExtendedBlock>> entry : scrubQueue.entrySet()) {
+      String storageId = entry.getKey();
+      Set<ExtendedBlock> extendedBlocks = entry.getValue();
+
+      if (extendedBlocks.isEmpty()) {
+        continue;
+      }
+
+      Set<Block> blocksToScrub = new HashSet<>();
+      for (ExtendedBlock eb : extendedBlocks) {
+        blocksToScrub.add(new Block(eb.getBlockId(), datanodeUuid));
+      }
+      List<Set<Block>> blockSetsToScrub = new ArrayList<>();
+      blockSetsToScrub.add(blocksToScrub);
+
+      // Store mapping for callback (blockId -> ExtendedBlock)
+      final Map<Long, ExtendedBlock> extendedBlockMap = new HashMap<>();
+      for (ExtendedBlock eb : extendedBlocks) {
+        extendedBlockMap.put(eb.getBlockId(), eb);
+      }
+
+      try {
+        boolean success = dn.dingoClient.declare(
+            blockSetsToScrub,
+            blocksToScrub.size(), // SCRUBBING is partially completable and has only 1 block set
+            deadline,
+            DeclarationProto.MaintenanceType.MAINTENANCE_TYPE_SCRUBBING,
+            scheduledBlockSets -> handleDingoScrubCallback(storageId, extendedBlockMap, scheduledBlockSets)
+        );
+
+        if (success) {
+          LOG.info("Declared {} blocks for storage {} to Dingo with deadline {}",
+              blocksToScrub.size(), storageId, deadline);
+        } else {
+          LOG.warn("Failed to declare blocks for storage {} to Dingo", storageId);
+        }
+      } catch (Exception e) {
+        LOG.error("Exception declaring blocks for storage {} to Dingo", storageId, e);
+      }
+    }
+  }
+
+  /**
+   * Handles callback from Dingo when blocks are scheduled.
+   * Runs scrubbing in separate thread (matches hdfs-declarative-io pattern).
+   */
+  private void handleDingoScrubCallback(
+      String storageId,
+      Map<Long, ExtendedBlock> extendedBlockMap,
+      List<Set<Block>> scheduledBlockSets) {
+
+    LOG.info("Received Dingo callback for storage {} with {} blocks",
+        storageId, scheduledBlockSets.get(0).size());
+
+    // Build ExtendedBlock set from scheduled Dingo blocks
+    Set<ExtendedBlock> scheduledBlocks = new HashSet<>();
+    for (Set<Block> blockSet : scheduledBlockSets) {
+      for (Block dingoBlock : blockSet) {
+        ExtendedBlock eb = extendedBlockMap.get(dingoBlock.getBlockId());
+        if (eb != null) {
+          scheduledBlocks.add(eb);
+        } else {
+          LOG.warn("Unknown block in Dingo callback: blockId={}", dingoBlock.getBlockId());
+        }
+      }
+    }
+
+    if (scheduledBlocks.isEmpty()) {
+      LOG.warn("No valid blocks in Dingo callback for storage {}", storageId);
+      return;
+    }
+
+    // Trigger scrubbing in executor (matches hdfs-declarative-io pattern)
+    scrubbingExecutorService.submit(() -> {
+      try {
+        dn.triggerScrub(storageId, scheduledBlocks);
+      } catch (Exception e) {
+        LOG.error("Error during triggerScrub for storage {}", storageId, e);
+      }
+    });
+  }
+  // ------------------ Dingo Integration ------------------
 
   @VisibleForTesting
   void sendLifelineForTests() throws IOException {
@@ -622,6 +751,11 @@ class BPServiceActor implements Runnable {
     if (commandProcessingThread != null) {
       commandProcessingThread.interrupt();
     }
+    // ------------------ Dingo Integration ------------------
+    if (scrubbingExecutorService != null && !scrubbingExecutorService.isShutdown()) {
+      scrubbingExecutorService.shutdownNow();
+    }
+    // ------------------ Dingo Integration ------------------
   }
   
   //This must be called only by blockPoolManager
@@ -643,6 +777,11 @@ class BPServiceActor implements Runnable {
     IOUtils.cleanupWithLogger(null, bpNamenode);
     IOUtils.cleanupWithLogger(null, lifelineSender);
     bpos.shutdownActor(this);
+    // ------------------ Dingo Integration ------------------
+    if (!scrubbingExecutorService.isShutdown()) {
+      scrubbingExecutorService.shutdownNow();
+    }
+    // ------------------ Dingo Integration ------------------    
   }
 
   private void handleRollingUpgradeStatus(HeartbeatResponse resp) throws IOException {
