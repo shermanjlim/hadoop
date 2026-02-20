@@ -920,6 +920,7 @@ public class Balancer {
       final BalancerParameters p, Configuration conf)
       throws IOException, InterruptedException {
     DefaultMetricsSystem.initialize("Balancer");
+    DefaultMetricsSystem.setMiniClusterMode(true);
     JvmMetrics.create("Balancer",
         conf.get(DFSConfigKeys.DFS_METRICS_SESSION_ID_KEY),
         DefaultMetricsSystem.instance());
