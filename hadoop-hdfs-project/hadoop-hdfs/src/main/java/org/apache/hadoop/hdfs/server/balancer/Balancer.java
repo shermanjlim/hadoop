@@ -76,6 +76,12 @@ import org.apache.hadoop.util.ToolRunner;
 
 import org.apache.hadoop.util.Preconditions;
 
+// ------------------ Dingo Integration ------------------
+import java.util.concurrent.ConcurrentHashMap;
+import org.apache.hadoop.thirdparty.protobuf.ServiceException;
+import dingo.DingoClient;
+// ------------------ Dingo Integration ------------------
+
 /** <p>The balancer is a tool that balances disk space usage on an HDFS cluster
  * when some datanodes become full or when new empty nodes join the cluster.
  * The tool is deployed as an application program that can be run by the 
@@ -236,6 +242,10 @@ public class Balancer {
       = new LinkedList<StorageGroup>();
   private final Collection<StorageGroup> underUtilized
       = new LinkedList<StorageGroup>();
+      
+  // ------------------ Dingo Integration ------------------
+  private static ConcurrentHashMap<String, Long> declarativeRequestMetadata;
+  // ------------------ Dingo Integration ------------------
 
   /* Check that this Balancer is compatible with the Block Placement Policy
    * used by the Namenode.
@@ -361,6 +371,12 @@ public class Balancer {
         DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT);
     this.metrics = BalancerMetrics.create(this);
   }
+
+  // ------------------ Dingo Integration ------------------
+  public Dispatcher getDispatcher() {
+    return this.dispatcher;
+  }
+  // ------------------ Dingo Integration ------------------
   
   private static long getCapacity(DatanodeStorageReport report, StorageType t) {
     long capacity = 0L;
@@ -718,6 +734,11 @@ public class Balancer {
 
   /** Run an iteration for all datanodes. */
   Result runOneIteration() {
+    return runOneIteration(null);
+  }
+
+  private Result runOneIteration(ConcurrentHashMap<String, Long> declarativeRequestMetadata) {
+    boolean skip_shutdown = false;
     try {
       metrics.setIterateRunning(true);
       final List<DatanodeStorageReport> reports = dispatcher.init();
@@ -762,10 +783,17 @@ public class Balancer {
        * available to move.
        * Exit no byte has been moved for 5 consecutive iterations.
        */
-      if (!dispatcher.dispatchAndCheckContinue()) {
+      if (declarativeRequestMetadata == null && !dispatcher.dispatchAndCheckContinue()) {
+        return newResult(ExitStatus.NO_MOVE_PROGRESS, bytesLeftToMove, bytesBeingMoved);
+      }
+      if (declarativeRequestMetadata != null && !dispatcher.dispatchAndCheckContinue(declarativeRequestMetadata)) {
         return newResult(ExitStatus.NO_MOVE_PROGRESS, bytesLeftToMove, bytesBeingMoved);
       }
 
+      // TODO: double check if this needs to happen in declarative too
+      if (declarativeRequestMetadata != null) {
+        skip_shutdown = true;
+      }
       return newResult(ExitStatus.IN_PROGRESS, bytesLeftToMove, bytesBeingMoved);
     } catch (IllegalArgumentException e) {
       System.out.println(e + ".  Exiting ...");
@@ -776,9 +804,14 @@ public class Balancer {
     } catch (InterruptedException e) {
       System.out.println(e + ".  Exiting ...");
       return newResult(ExitStatus.INTERRUPTED);
+    } catch (ServiceException s) {
+      System.out.println(s + ". Exiting ...");
+      return newResult(ExitStatus.INTERRUPTED);
     } finally {
       metrics.setIterateRunning(false);
-      dispatcher.shutdownNow();
+      if (!skip_shutdown) {
+        dispatcher.shutdownNow();
+      }
     }
   }
 
@@ -791,6 +824,12 @@ public class Balancer {
   static private int doBalance(Collection<URI> namenodes,
       Collection<String> nsIds, final BalancerParameters p, Configuration conf)
       throws IOException, InterruptedException {
+    return doBalance(namenodes, nsIds, p, conf, null);
+  }
+
+  static private int doBalance(Collection<URI> namenodes,
+                               Collection<String> nsIds, final BalancerParameters p, Configuration conf, ConcurrentHashMap<String, Long> declarativeRequestMetadata)
+          throws IOException, InterruptedException {
     final long sleeptime =
         conf.getTimeDuration(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,
             DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_DEFAULT,
@@ -799,6 +838,7 @@ public class Balancer {
             DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_INTERVAL_SECONDS_KEY,
             DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_INTERVAL_SECONDS_DEFAULT,
             TimeUnit.SECONDS, TimeUnit.MILLISECONDS);
+    LOG.info("sleeptime = " + sleeptime);
     LOG.info("namenodes  = " + namenodes);
     LOG.info("parameters = " + p);
     LOG.info("included nodes = " + p.getIncludedNodes());
@@ -818,12 +858,31 @@ public class Balancer {
       for(int iteration = 0; !done; iteration++) {
         done = true;
         Collections.shuffle(connectors);
+        // TODO: Assuming one nnc for now
         for(NameNodeConnector nnc : connectors) {
           if (p.getBlockPools().size() == 0
               || p.getBlockPools().contains(nnc.getBlockpoolID())) {
+
+            // Reset at beginning rather than end so that mappings still exist if declarations arrive after
+            Dispatcher.clearAndReset();
+
             final Balancer b = new Balancer(nnc, p, conf);
-            final Result r = b.runOneIteration();
+            final Result r = b.runOneIteration(declarativeRequestMetadata);
             r.print(iteration, nnc, System.out);
+
+            long bytesLastMoved = b.getDispatcher().getBytesMoved();
+            long blocksLastMoved = b.getDispatcher().getBlocksMoved();
+
+            // Wait for outstanding requests to finish
+            while (Dispatcher.hasOutstandingDeclarations()) {
+              LOG.info("[Balancer] Waiting for outstanding declarations...");
+              Thread.sleep(sleeptime);
+            }
+
+            long bytesMoved = b.getDispatcher().getBytesMoved() - bytesLastMoved;
+            long blocksMoved = b.getDispatcher().getBlocksMoved() - blocksLastMoved;
+            LOG.info("Total bytes (blocks) moved in this iteration {} ({})",
+                StringUtils.byteDesc(bytesMoved), blocksMoved);
 
             // clean all lists
             b.resetData(conf);
@@ -867,6 +926,11 @@ public class Balancer {
     if (!p.getRunAsService()) {
       return doBalance(namenodes, nsIds, p, conf);
     }
+    declarativeRequestMetadata = new ConcurrentHashMap<>();
+    String dingoServerAddress = conf.get(
+        DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_KEY,
+        DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_DEFAULT);    
+    Dispatcher.dingoClient = new DingoClient(dingoServerAddress);
     if (!serviceRunning) {
       serviceRunning = true;
     } else {
@@ -884,7 +948,7 @@ public class Balancer {
 
     while (serviceRunning) {
       try {
-        int retCode = doBalance(namenodes, nsIds, p, conf);
+        int retCode = doBalance(namenodes, nsIds, p, conf, declarativeRequestMetadata);
         if (retCode < 0) {
           LOG.info("Balance failed, error code: " + retCode);
           FAILED_TIMES_SINCE_LAST_SUCCESSFUL_BALANCE.incrementAndGet();
@@ -910,6 +974,7 @@ public class Balancer {
       Thread.sleep(scheduleInterval);
     }
     DefaultMetricsSystem.shutdown();
+    Dispatcher.shutdown();
 
     // normal stop
     return 0;

@@ -47,6 +47,8 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   public static final String DECLARATIVE_SCRUBBING_DEADLINE_SECONDS_KEY =
       "declarative.scrubbing.deadline.seconds";
   public static final long DECLARATIVE_SCRUBBING_DEADLINE_SECONDS_DEFAULT = 3L;
+  public static final String DECLARATIVE_REBALANCE_DEADLINE_SECONDS_KEY = "declarative.rebalance.deadline.seconds";
+  public static final long DECLARATIVE_REBALANCE_DEADLINE_SECONDS_DEFAULT = 3L;
   // ------------------ Dingo Integration ------------------
     
   public static final String  DFS_BLOCK_SIZE_KEY =

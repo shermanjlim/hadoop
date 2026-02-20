@@ -87,6 +87,16 @@ import org.apache.hadoop.util.Time;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.util.Preconditions;
 
+// ------------------ Dingo Integration ------------------
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DECLARATIVE_REBALANCE_DEADLINE_SECONDS_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DECLARATIVE_REBALANCE_DEADLINE_SECONDS_DEFAULT;
+import dingo.DingoClient;
+import dingo.DeclarationProto;
+import java.time.Instant;
+import org.apache.hadoop.thirdparty.protobuf.ServiceException;
+import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
+// ------------------ Dingo Integration ------------------
+
 /** Dispatching block replica moves between datanodes. */
 @InterfaceAudience.Private
 public class Dispatcher {
@@ -142,6 +152,43 @@ public class Dispatcher {
   private BlockPlacementPolicies placementPolicies;
 
   private long maxIterationTime;
+
+  // ------------------ Dingo Integration ------------------
+  private final long rebalanceDeadlineSeconds;
+  private final long defaultBlockSize;
+
+  // Thread-safe maps for concurrent access from main thread and DINGO callback thread
+  private static final ConcurrentHashMap<String, Long> outstandingDeclarations = new ConcurrentHashMap<>();
+  private static final ConcurrentHashMap<String, Long> outstandingDeclarationBytes = new ConcurrentHashMap<>();
+  private static final ConcurrentHashMap<String, Integer> srcToMod = new ConcurrentHashMap<>();
+  private static final ConcurrentHashMap<String, Long> averageBlockSize = new ConcurrentHashMap<>();
+
+  public static DingoClient dingoClient;
+
+  // Executor service for handling DINGO callbacks asynchronously (avoids blocking gRPC thread)
+  private static final ExecutorService rebalanceExecutorService = Executors.newFixedThreadPool(3);
+
+  static void clearAndReset() {
+    LOG.info("[Dispatcher] clearing outstanding declarations, source to modulus mapping");
+    outstandingDeclarations.clear();
+    outstandingDeclarationBytes.clear();
+    srcToMod.clear();
+  }
+
+  public static void shutdown() {
+    if (rebalanceExecutorService != null && !rebalanceExecutorService.isShutdown()) {
+      rebalanceExecutorService.shutdown();
+    }
+    if (dingoClient != null) {
+      try {
+        dingoClient.close();
+        LOG.info("Dingo client shutdown successfully");
+      } catch (Exception e) {
+        LOG.warn("Exception shutting down Dingo client", e);
+      }
+    }    
+  }
+  // ------------------ Dingo Integration ------------------
 
   static class Allocator {
     private final int max;
@@ -277,6 +324,23 @@ public class Dispatcher {
           return true;
         }
       }
+      return false;
+    }
+
+    private boolean chooseBlockAndProxy(Block block) {
+      final StorageType t = source.getStorageType();
+      for (Iterator<DBlock> i = source.getBlockIterator(); i.hasNext();) {
+        DBlock db = i.next();
+        if (db.getBlock().getBlockId() == block.getBlockId()) {
+          if (markMovedIfGoodBlock(db, t)) {
+            i.remove();
+            return true;
+          } else {
+            LOG.info("[Dispatcher] block is not good {}", block);
+          }
+        }
+      }
+      LOG.info("[Dispatcher] block is not found {}", block);
       return false;
     }
 
@@ -829,6 +893,14 @@ public class Dispatcher {
       return srcBlocks.iterator();
     }
 
+    public int getSrcBlocksLength() {
+      return srcBlocks.size();
+    }
+
+    List<DBlock> getSrcBlocks() {
+      return srcBlocks;
+    }
+
     /**
      * Fetch new blocks of this source from namenode and update this source's
      * block list & {@link Dispatcher#globalBlocks}.
@@ -836,10 +908,19 @@ public class Dispatcher {
      * @return the total size of the received blocks in the number of bytes.
      */
     private long getBlockList() throws IOException, IllegalArgumentException {
+      return getBlockList(false);
+    }
+
+    private long getBlockList(boolean isDeclarative) throws IOException, IllegalArgumentException {
       final long size = Math.min(getBlocksSize, blocksToReceive);
-      final BlocksWithLocations newBlksLocs =
-          nnc.getBlocks(getDatanodeInfo(), size, getBlocksMinBlockSize,
-              hotBlockTimeInterval, storageType);
+      final BlocksWithLocations newBlksLocs;
+      
+      if (isDeclarative) {
+        newBlksLocs = nnc.getBlocks(getDatanodeInfo(), Long.MAX_VALUE, getBlocksMinBlockSize, hotBlockTimeInterval, storageType);
+        LOG.info("[Dispatcher] Source {} retrieved {} blocks", this.getDatanodeInfo().getDatanodeUuid(), newBlksLocs.getBlocks().length);
+      } else {
+        newBlksLocs = nnc.getBlocks(getDatanodeInfo(), getBlocksSize, getBlocksMinBlockSize, hotBlockTimeInterval, storageType);
+      }
 
       if (LOG.isTraceEnabled()) {
         LOG.trace("getBlocks(" + getDatanodeInfo() + ", "
@@ -848,11 +929,13 @@ public class Dispatcher {
       }
 
       long bytesReceived = 0;
+      long blocksReceived = 0;
       for (BlockWithLocations blkLocs : newBlksLocs.getBlocks()) {
         // Skip small blocks.
         if (blkLocs.getBlock().getNumBytes() < getBlocksMinBlockSize) {
           continue;
         }
+        blocksReceived++;
 
         DBlock block;
         if (blkLocs instanceof StripedBlockWithLocations) {
@@ -904,12 +987,23 @@ public class Dispatcher {
             }
           }
           if (!srcBlocks.contains(block) && isGoodBlockCandidate(block)) {
-            if (LOG.isTraceEnabled()) {
-              LOG.trace("Add " + block + " to " + this);
+            long blockId = block.getBlock().getBlockId();
+            if (block instanceof DBlockStriped) {
+              blockId = blockId / -1 / HdfsServerConstants.MAX_BLOCKS_IN_GROUP;
             }
-            srcBlocks.add(block);
+            if (!isDeclarative || blockId % srcToMod.size() == srcToMod.get(this.getDatanodeInfo().getDatanodeUuid())) {
+              if (LOG.isTraceEnabled()) {
+                LOG.trace("Add " + block + " to " + this);
+              }
+              srcBlocks.add(block);
+            }
           }
         }
+      }
+      if (blocksReceived > 0) {
+        LOG.info("[Dispatcher] Datanode {} has average block size {} bytes, srcBlocks has {} blocks",
+            this.getDatanodeInfo().getDatanodeUuid(), bytesReceived / blocksReceived, srcBlocks.size());
+        averageBlockSize.put(this.getDatanodeInfo().getDatanodeUuid(), bytesReceived / blocksReceived);
       }
       return bytesReceived;
     }
@@ -946,6 +1040,30 @@ public class Dispatcher {
         if (target.addPendingBlock(pendingBlock)) {
           // target is not busy, so do a tentative block allocation
           if (pendingBlock.chooseBlockAndProxy()) {
+            long blockSize = pendingBlock.reportedBlock.getNumBytes(this);
+            incScheduledSize(-blockSize);
+            task.size -= blockSize;
+            if (task.size <= 0) {
+              i.remove();
+            }
+            return pendingBlock;
+          } else {
+            // cancel the tentative move
+            target.removePendingBlock(pendingBlock);
+          }
+        }
+      }
+      return null;
+    }
+
+    private PendingMove chooseNextMove(Block block) {
+      for (Iterator<Task> i = tasks.iterator(); i.hasNext();) {
+        final Task task = i.next();
+        final DDatanode target = task.target.getDDatanode();
+        final PendingMove pendingBlock = new PendingMove(this, task.target);
+        if (target.addPendingBlock(pendingBlock)) {
+          // target is not busy, so do a tentative block allocation
+          if (pendingBlock.chooseBlockAndProxy(block)) {
             long blockSize = pendingBlock.reportedBlock.getNumBytes(this);
             incScheduledSize(-blockSize);
             task.size -= blockSize;
@@ -1052,6 +1170,22 @@ public class Dispatcher {
         LOG.info("The maximum iteration time (" + maxIterationTime/1000
             + " seconds) has been reached. Stopping " + this);
       }
+
+    }
+
+    private void dispatchBlocks(Block block) {
+      final PendingMove p = chooseNextMove(block);
+      if (p != null) {
+        executePendingMove(p);
+        removeMovedBlocks();
+      } else {
+        LOG.info("[Dispatcher] Move for {} is no longer valid, {} bytes", block, block.getNumBytes());
+      }
+
+      if (isIterationOver()) {
+        LOG.info("The maximum iteration time (" + maxIterationTime/1000
+                + " seconds) has been reached. Stopping " + this);
+      }
     }
 
     @Override
@@ -1109,6 +1243,15 @@ public class Dispatcher {
         HdfsClientConfigKeys.DFS_CLIENT_USE_DN_HOSTNAME_DEFAULT);
     placementPolicies = new BlockPlacementPolicies(conf, null, cluster, null);
     this.maxIterationTime = maxIterationTime;
+
+    // ------------------ Dingo Integration ------------------
+    rebalanceDeadlineSeconds = conf.getLong(
+        DECLARATIVE_REBALANCE_DEADLINE_SECONDS_KEY,
+        DECLARATIVE_REBALANCE_DEADLINE_SECONDS_DEFAULT);
+    LOG.info("Dingo REBALANCE deadline configured to {} seconds", rebalanceDeadlineSeconds);
+    this.defaultBlockSize = conf.getLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,
+        DFSConfigKeys.DFS_BLOCK_SIZE_DEFAULT);    
+    // ------------------ Dingo Integration ------------------
   }
 
   public DistributedFileSystem getDistributedFileSystem() {
@@ -1147,6 +1290,7 @@ public class Dispatcher {
 
   void add(Source source, StorageGroup target) {
     sources.add(source);
+    srcToMod.putIfAbsent(source.getDatanodeInfo().getDatanodeUuid(), srcToMod.size());
     targets.add(target);
   }
 
@@ -1220,8 +1364,132 @@ public class Dispatcher {
     moveExecutor.execute(p::dispatch);
   }
 
-  public boolean dispatchAndCheckContinue() throws InterruptedException {
+  public boolean dispatchAndCheckContinue() throws InterruptedException, ServiceException {
     return nnc.shouldContinue(dispatchBlockMoves());
+  }
+
+  public boolean dispatchAndCheckContinue(ConcurrentHashMap<String, Long> declarativeRequestMetadata) throws InterruptedException, ServiceException {
+    return nnc.shouldContinue(dispatchDeclarativeNeeds(declarativeRequestMetadata));
+  }
+
+  /**
+   * Declares number of blocks that need to be moved to the I/O Planner.
+   * Balancer does not make a decision of what blocks to be moved, rather how many.
+   * Balancer will receive a callback of what blocks to move and that will trigger
+   * the old flow of balancing without `chooseNextMove`
+   * declarativeRequestMetadata: Concurrent hashmap that maps datanode to Number of blocks
+   * @return Number of unique blocks declared to the I/O Planner
+   */
+  private long dispatchDeclarativeNeeds(ConcurrentHashMap<String, Long> declarativeRequestMetadata) throws ServiceException {
+    long newRequests = 0;
+    final Iterator<Source> i = sources.iterator();
+    while (i.hasNext()) {
+      Source s = i.next();
+      long scheduledSize = s.getScheduledSize();
+      if (scheduledSize <= 0) {
+        continue;
+      }
+      long numBytes = scheduledSize; //(long) Math.ceil(((double) scheduledSize / (double) blockSize));
+      // Now add to metadata and reduce the size
+      String uuid = s.getDatanodeInfo().getDatanodeUuid();
+
+      try {
+        final long received = s.getBlockList(true);
+        LOG.info("[Dispatcher] Source {} retrieved {} bytes of blocks", uuid, received);
+        if (received == 0) {
+          LOG.info("[Dispatcher] Dispatcher retrieved no bytes, skip dispatch");
+          continue;
+        }
+      } catch (IOException | IllegalArgumentException e) {
+        LOG.warn("Exception while getting reportedBlock list", e);
+      }
+
+      long nodeAverageBlockSize = averageBlockSize.getOrDefault(uuid, this.defaultBlockSize);
+      long blocksNeeded = numBytes / nodeAverageBlockSize + 1;
+      blocksNeeded = Math.min(blocksNeeded, s.getSrcBlocksLength());
+
+      if (outstandingDeclarations.containsKey(uuid)) {
+        continue;
+      } else if (s.getSrcBlocksLength() == 0) {
+        LOG.info("[Dispatcher] No valid source blocks for {}, skip dispatch", uuid);
+        continue;
+      } else {
+        LOG.info("[Dispatcher] Source {} will wait for {} blocks or {} bytes", uuid, blocksNeeded, numBytes);
+        outstandingDeclarations.put(uuid, blocksNeeded);
+        outstandingDeclarationBytes.put(uuid, numBytes);
+      }
+
+      declarativeRequestMetadata.put(uuid, declarativeRequestMetadata.getOrDefault(uuid, 0L) + numBytes);
+      newRequests += numBytes;
+
+      // send declaration to DINGO
+      List<DBlock> dBlocks = s.getSrcBlocks();
+
+      Set<dingo.Block> blocksToRebalance = new HashSet<>();
+      for (DBlock db : dBlocks) {
+        blocksToRebalance.add(new dingo.Block(db.getBlock().getBlockId(), uuid));
+      }
+      List<Set<dingo.Block>> blockSetsToRebalance = new ArrayList<>();
+      blockSetsToRebalance.add(blocksToRebalance);
+
+      // Store mapping for callback (blockId -> DBlock)
+      final Map<Long, DBlock> dBlockMap = new HashMap<>();
+      for (DBlock db : dBlocks) {
+        dBlockMap.put(db.getBlock().getBlockId(), db);
+      }
+
+      try {
+        long deadline = Instant.now().getEpochSecond() + rebalanceDeadlineSeconds;
+        boolean success = dingoClient.declare(
+            blockSetsToRebalance,
+            blocksNeeded, // Rebalancing is partially completable and has only 1 block set
+            deadline,
+            DeclarationProto.MaintenanceType.MAINTENANCE_TYPE_REBALANCE,
+            // Run callback asynchronously to avoid blocking DINGO's gRPC callback thread
+            scheduledBlockSets -> {
+              rebalanceExecutorService.submit(() -> {
+                try {
+                  dispatchBlockMoves(uuid, dBlockMap, scheduledBlockSets);
+                } catch (Exception e) {
+                  LOG.error("Error during dispatchBlockMoves for storage {}", uuid, e);
+                }
+              });
+            }
+        );
+        if (success) {
+          LOG.info("Declared {} blocks for storage {} to Dingo with deadline {}",
+              blocksToRebalance.size(), uuid, deadline);
+        } else {
+          LOG.warn("Failed to declare blocks for storage {} to Dingo", uuid);
+        }
+      } catch (Exception e) {
+        LOG.error("Exception declaring blocks for storage {} to Dingo", uuid, e);
+      }
+    }
+    return newRequests;
+  }
+
+  public void updateOutstandingDeclarations(String uuid, long blocksMoved, long bytesMoved) {
+    if (outstandingDeclarations.containsKey(uuid)) {
+      long remainingBlocks = outstandingDeclarations.get(uuid);
+      long remainingBytes = outstandingDeclarationBytes.get(uuid);
+      LOG.info("[Dispatcher] Updating outstanding declaration for {} with {}-{} blocks ({}-{} bytes)",
+          uuid, remainingBlocks, blocksMoved, remainingBytes, bytesMoved);
+      remainingBlocks -= blocksMoved;
+      remainingBytes -= bytesMoved;
+      if (remainingBlocks <= 0 || remainingBytes <= 0) {
+        LOG.info("[Dispatcher] Removing outstanding declaration {}", uuid);
+        outstandingDeclarations.remove(uuid);
+        outstandingDeclarationBytes.remove(uuid);
+      } else {
+        outstandingDeclarations.put(uuid, remainingBlocks);
+        outstandingDeclarationBytes.put(uuid, remainingBytes);
+      }
+    }
+  }
+
+  public static boolean hasOutstandingDeclarations() {
+    return !outstandingDeclarations.isEmpty();
   }
 
   /**
@@ -1286,6 +1554,91 @@ public class Dispatcher {
         StringUtils.byteDesc(getBytesMoved() - bytesLastMoved),
         (getBlocksMoved() - blocksLastMoved));
 
+    return getBytesMoved() - bytesLastMoved;
+  }
+
+  /**
+   * Dispatch block moves for each source. The thread selects blocks to move &
+   * sends request to proxy source to initiate block move. The process is flow
+   * controlled. Block selection is blocked if there are too many un-confirmed
+   * block moves.
+   *
+   * @return the total number of bytes successfully moved in this iteration.
+   */
+  public long dispatchBlockMoves(String sourceUuid, Map<Long, DBlock> dBlockMap, List<Set<dingo.Block>> scheduledBlockSets) {
+    // Safety check for empty or null scheduledBlockSets
+    if (scheduledBlockSets == null || scheduledBlockSets.isEmpty() || scheduledBlockSets.get(0).isEmpty()) {
+      LOG.warn("[Dispatcher] Received empty or null scheduledBlockSets for storage {}", sourceUuid);
+      return 0;
+    }
+
+    LOG.info("Received Dingo callback for storage {} with {} blocks",
+        sourceUuid, scheduledBlockSets.get(0).size());
+
+    final long bytesLastMoved = getBytesMoved();
+    Set<dingo.Block> scheduledBlocks = scheduledBlockSets.get(0);
+
+    if (targets.isEmpty()) {
+      LOG.info("[Dispatcher] Ignoring dispatch because there are no targets remaining");
+      return 1;
+    }
+
+    int concurrentThreads = Math.min(sources.size(),
+            ((ThreadPoolExecutor)dispatchExecutor).getCorePoolSize());
+    assert concurrentThreads > 0 : "Number of concurrent threads is 0.";
+    LOG.info("Balancer concurrent dispatcher threads = {}", concurrentThreads);
+
+    // Determine the size of each mover thread pool per target
+    int threadsPerTarget = maxMoverThreads/targets.size();
+    if (threadsPerTarget == 0) {
+      // Some scheduled moves will get ignored as some targets won't have
+      // any threads allocated.
+      moverThreadAllocator.setLotSize(1);
+      LOG.warn(DFSConfigKeys.DFS_BALANCER_MOVERTHREADS_KEY + "=" +
+              maxMoverThreads + " is too small for moving blocks to " +
+              targets.size() + " targets. Balancing may be slower.");
+    } else {
+      if  (threadsPerTarget > maxConcurrentMovesPerNode) {
+        threadsPerTarget = maxConcurrentMovesPerNode;
+        LOG.info("Limiting threads per target to the specified max.");
+      }
+      moverThreadAllocator.setLotSize(threadsPerTarget);
+      LOG.info("Allocating " + threadsPerTarget + " threads per target.");
+    }
+
+    long bytesFromReq = 0;
+    final Iterator<Source> i = sources.iterator();
+    while (i.hasNext()) {
+      final Source s = i.next();
+      String datanodeUUID = s.getDatanodeInfo().getDatanodeUuid();
+      if (!datanodeUUID.equals(sourceUuid)) {
+        continue;
+      }
+      try {
+        s.getBlockList(true);
+      } catch (IOException | IllegalArgumentException e) {
+        LOG.warn("Exception while getting reportedBlock list", e);
+      }
+      for (dingo.Block dingoBlock : scheduledBlocks) {
+        DBlock dBlock = dBlockMap.get(dingoBlock.getBlockId());
+        if (dBlock == null) {
+          LOG.warn("Unknown block in Dingo callback: blockId={}", dingoBlock.getBlockId());
+          continue;
+        }
+        s.dispatchBlocks(new Block(
+          dingoBlock.getBlockId(), dBlock.getNumBytes(s), dBlock.getBlock().getGenerationStamp()));
+        bytesFromReq += dBlock.getNumBytes(s);
+      }
+      break;
+    }
+
+    // wait for all reportedBlock moving to be done
+    waitForMoveCompletion(targets);
+
+    // Update progress on declaration
+    this.updateOutstandingDeclarations(sourceUuid, scheduledBlocks.size(), bytesFromReq);
+
+    // These values might be incorrect if multiple dispatches are happening concurrently
     return getBytesMoved() - bytesLastMoved;
   }
 
@@ -1411,6 +1764,7 @@ public class Dispatcher {
 
   /** Reset all fields in order to prepare for the next iteration */
   void reset(Configuration conf) {
+    LOG.info("[Dispatcher] resetting sources and targets");
     cluster = NetworkTopology.getInstance(conf);
     storageGroupMap.clear();
     sources.clear();
