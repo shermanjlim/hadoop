@@ -61,6 +61,18 @@ import org.apache.hadoop.util.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+// ------------------ Dingo Integration ------------------
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DECLARATIVE_RECONSTRUCTION_DEADLINE_SECONDS_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DECLARATIVE_RECONSTRUCTION_DEADLINE_SECONDS_DEFAULT;
+
+import dingo.DingoClient;
+import dingo.DeclarationProto;
+
+import java.time.Instant;
+// ------------------ Dingo Integration ------------------
+
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import java.io.IOException;
@@ -227,6 +239,14 @@ public class DatanodeManager {
    */
   private final long timeBetweenResendingCachingDirectivesMs;
 
+  // ------------------ Dingo Integration ------------------
+  private final long reconstructionDeadlineSeconds;
+  private final DingoClient dingoClient;
+
+  private final Map<String, List<BlockTargetPair>> readyLists = new ConcurrentHashMap<>();
+  private final Map<String, List<BlockECReconstructionInfo>> readyECLists = new ConcurrentHashMap<>();
+  // ------------------ Dingo Integration ------------------  
+
   DatanodeManager(final BlockManager blockManager, final Namesystem namesystem,
       final Configuration conf) throws IOException {
     this.namesystem = namesystem;
@@ -358,6 +378,17 @@ public class DatanodeManager {
     this.blocksPerPostponedMisreplicatedBlocksRescan = conf.getLong(
         DFSConfigKeys.DFS_NAMENODE_BLOCKS_PER_POSTPONEDBLOCKS_RESCAN_KEY,
         DFSConfigKeys.DFS_NAMENODE_BLOCKS_PER_POSTPONEDBLOCKS_RESCAN_KEY_DEFAULT);
+
+    // ------------------ Dingo Integration ------------------
+    reconstructionDeadlineSeconds = conf.getLong(
+        DECLARATIVE_RECONSTRUCTION_DEADLINE_SECONDS_KEY,
+        DECLARATIVE_RECONSTRUCTION_DEADLINE_SECONDS_DEFAULT);
+    String dingoServerAddress = conf.get(
+        DFS_DINGO_SERVER_ADDRESS_KEY,
+        DFS_DINGO_SERVER_ADDRESS_DEFAULT);
+    this.dingoClient = new DingoClient(dingoServerAddress);
+    LOG.info("Dingo client initialized with server address: {}", dingoServerAddress);
+    // ------------------ Dingo Integration ------------------        
   }
 
   /**
@@ -481,6 +512,17 @@ public class DatanodeManager {
     datanodeAdminManager.close();
     heartbeatManager.close();
     stopSlowPeerCollector();
+
+    // ------------------ Dingo Integration ------------------
+    if (dingoClient != null) {
+      try {
+        dingoClient.close();
+        LOG.info("Dingo client shutdown successfully");
+      } catch (Exception e) {
+        LOG.warn("Exception shutting down Dingo client", e);
+      }
+    }
+    // ------------------ Dingo Integration ------------------    
   }
 
   /** @return the network topology. */
@@ -1846,6 +1888,7 @@ public class DatanodeManager {
       return new DatanodeCommand[]{brCommand};
     }
 
+    String datanodeUuid = nodeinfo.getDatanodeUuid();
     final List<DatanodeCommand> cmds = new ArrayList<>();
     // Allocate _approximately_ maxTransfers pending tasks to DataNode.
     // NN chooses pending tasks based on the ratio between the lengths of
@@ -1884,6 +1927,7 @@ public class DatanodeManager {
       if(pendingECReplicatedList != null && !pendingECReplicatedList.isEmpty()) {
         pendingList.addAll(pendingECReplicatedList);
       }
+      // ------------------ Dingo Integration ------------------
       if (!pendingList.isEmpty()) {
         // If the block is deleted, the block size will become
         // BlockCommand.NO_ACK (LONG.MAX_VALUE) . This kind of block we don't
@@ -1900,18 +1944,113 @@ public class DatanodeManager {
           }
         }
         if (!pendingList.isEmpty()) {
-          cmds.add(new BlockCommand(DatanodeProtocol.DNA_TRANSFER, blockPoolId,
-              pendingList));
+          // --- We declare the blocks instead of doing the reconstruction immediately ---
+          // cmds.add(new BlockCommand(DatanodeProtocol.DNA_TRANSFER, blockPoolId,
+          //     pendingList));
+
+          Set<dingo.Block> blocksToReconstruct = new HashSet<>();
+          for (BlockTargetPair blockTargetPair : pendingList) {
+            blocksToReconstruct.add(
+              new dingo.Block(blockTargetPair.block.getBlockId(), datanodeUuid)
+            );
+          }
+          List<Set<dingo.Block>> blockSetsToReconstruct = new ArrayList<>();
+          blockSetsToReconstruct.add(blocksToReconstruct);
+
+          try {
+            long deadline = Instant.now().getEpochSecond() + reconstructionDeadlineSeconds;
+            boolean success = dingoClient.declare(
+                blockSetsToReconstruct,
+                1,
+                deadline,
+                DeclarationProto.MaintenanceType.MAINTENANCE_TYPE_RECONSTRUCTION,
+                scheduledBlockSets -> {
+                  if (scheduledBlockSets.isEmpty() || scheduledBlockSets.get(0).size() != pendingList.size()) {
+                    LOG.error("Did not get correct scheduled block sets for reconstruction");
+                    return;
+                  }
+                  readyLists.compute(datanodeUuid, (k, existing) -> {
+                    if (existing == null) existing = new ArrayList<>();
+                    existing.addAll(pendingList);
+                    return existing;
+                  });
+                }
+            );
+            if (success) {
+              LOG.info("Declared {} blocks for storage {} to Dingo with deadline {}",
+                  blocksToReconstruct.size(), datanodeUuid, deadline);
+            } else {
+              LOG.warn("Failed to declare blocks for storage {} to Dingo", datanodeUuid);
+            }
+          } catch (Exception e) {
+            LOG.error("Exception declaring blocks for storage {} to Dingo", datanodeUuid, e);
+          }
         }
       }
       // check pending erasure coding tasks
       List<BlockECReconstructionInfo> pendingECList = nodeinfo
           .getErasureCodeCommand(numECReconstructedTasks);
       if (pendingECList != null && !pendingECList.isEmpty()) {
-        cmds.add(new BlockECReconstructionCommand(
-            DNA_ERASURE_CODING_RECONSTRUCTION, pendingECList));
+        // --- We declare the blocks instead of doing the reconstruction immediately ---
+        // cmds.add(new BlockECReconstructionCommand(
+        //     DNA_ERASURE_CODING_RECONSTRUCTION, pendingECList));
+
+        Set<dingo.Block> blocksToReconstruct = new HashSet<>();
+        for (BlockECReconstructionInfo blockECReconstructionInfo : pendingECList) {
+          for (DatanodeInfo dn : blockECReconstructionInfo.getSourceDnInfos()) {
+            blocksToReconstruct.add(
+              new dingo.Block(blockECReconstructionInfo.getExtendedBlock().getBlockId(), dn.getDatanodeUuid())
+            );
+          }
+        }
+        List<Set<dingo.Block>> blockSetsToReconstruct = new ArrayList<>();
+        blockSetsToReconstruct.add(blocksToReconstruct);
+        final int expectedBlockCount = blocksToReconstruct.size();
+
+        try {
+          long deadline = Instant.now().getEpochSecond() + reconstructionDeadlineSeconds;
+          boolean success = dingoClient.declare(
+              blockSetsToReconstruct,
+              1,
+              deadline,
+              DeclarationProto.MaintenanceType.MAINTENANCE_TYPE_RECONSTRUCTION,
+              scheduledBlockSets -> {
+                if (scheduledBlockSets.isEmpty() || scheduledBlockSets.get(0).size() != expectedBlockCount) {
+                  LOG.error("Did not get correct scheduled block sets for EC reconstruction");
+                  return;
+                }
+                readyECLists.compute(datanodeUuid, (k, existing) -> {
+                  if (existing == null) existing = new ArrayList<>();
+                  existing.addAll(pendingECList);
+                  return existing;
+                });
+              }
+          );
+          if (success) {
+            LOG.info("Declared {} blocks for storage {} to Dingo with deadline {}",
+                blocksToReconstruct.size(), datanodeUuid, deadline);
+          } else {
+            LOG.warn("Failed to declare blocks for storage {} to Dingo", datanodeUuid);
+          }
+        } catch (Exception e) {
+          LOG.error("Exception declaring blocks for storage {} to Dingo", datanodeUuid, e);
+        }
       }
     }
+
+    // See if there are any scheduled reconstruction tasks assigned to this datanode
+    List<BlockTargetPair> readyList = readyLists.remove(datanodeUuid);
+    if (readyList != null && !readyList.isEmpty()) {
+      cmds.add(new BlockCommand(DatanodeProtocol.DNA_TRANSFER, blockPoolId,
+          readyList));
+    }
+
+    List<BlockECReconstructionInfo> readyECList = readyECLists.remove(datanodeUuid);
+    if (readyECList != null && !readyECList.isEmpty()) {
+      cmds.add(new BlockECReconstructionCommand(
+          DNA_ERASURE_CODING_RECONSTRUCTION, readyECList));
+    }
+    // ------------------ Dingo Integration ------------------
 
     // check block invalidation
     Block[] blks = nodeinfo.getInvalidateBlocks(blockInvalidateLimit);

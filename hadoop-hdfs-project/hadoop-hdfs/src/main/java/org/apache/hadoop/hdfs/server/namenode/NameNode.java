@@ -106,14 +106,6 @@ import org.apache.hadoop.util.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-// ------------------ Dingo Integration ------------------
-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_KEY;
-import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DINGO_SERVER_ADDRESS_DEFAULT;
-
-import dingo.DingoClient;
-import dingo.DeclarationProto;
-// ------------------ Dingo Integration ------------------
-
 import javax.management.ObjectName;
 
 import java.io.IOException;
@@ -491,10 +483,6 @@ public class NameNode extends ReconfigurableBase implements
   private ObjectName nameNodeStatusBeanName;
   protected final Tracer tracer;
   ScheduledThreadPoolExecutor metricsLoggerTimer;
-
-  // ------------------ Dingo Integration ------------------
-  public DingoClient dingoClient;
-  // ------------------ Dingo Integration ------------------
 
   /**
    * The namenode address that clients will use to access this namenode
@@ -1188,27 +1176,6 @@ public class NameNode extends ReconfigurableBase implements
         DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE,
         DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE_DEFAULT);
     this.started.set(true);
-
-    // ------------------ Dingo Integration ------------------
-    String dingoServerAddress = conf.get(
-        DFS_DINGO_SERVER_ADDRESS_KEY,
-        DFS_DINGO_SERVER_ADDRESS_DEFAULT);
-    this.dingoClient = new DingoClient(dingoServerAddress);
-    LOG.info("Dingo client initialized with server address: {}", dingoServerAddress);
-    // TODO: remove this - for testing only
-    this.dingoClient.declare(
-        Arrays.asList(
-            new HashSet<>(Arrays.asList(new dingo.Block(1, "node_a"), new dingo.Block(2, "node_b"))),
-            new HashSet<>(Arrays.asList(new dingo.Block(3, "node_c"), new dingo.Block(4, "node_d")))),
-        2,
-        Instant.now().getEpochSecond() + 3,
-        DeclarationProto.MaintenanceType.MAINTENANCE_TYPE_UNSPECIFIED,
-        blockSets -> {
-          LOG.info("Dingo client connected!");
-          LOG.info(dingo.Block.formatBlockSets(blockSets));
-        });
-    // ------------------ Dingo Integration ------------------
-
     DefaultMetricsSystem.instance().register(this);
   }
 
@@ -1285,17 +1252,6 @@ public class NameNode extends ReconfigurableBase implements
       if (levelDBAliasMapServer != null) {
         levelDBAliasMapServer.close();
       }
-
-      // ------------------ Dingo Integration ------------------
-      if (dingoClient != null) {
-        try {
-          dingoClient.close();
-          LOG.info("Dingo client shutdown successfully");
-        } catch (Exception e) {
-          LOG.warn("Exception shutting down Dingo client", e);
-        }
-      }
-      // ------------------ Dingo Integration ------------------
     }
     started.set(false);
     tracer.close();
