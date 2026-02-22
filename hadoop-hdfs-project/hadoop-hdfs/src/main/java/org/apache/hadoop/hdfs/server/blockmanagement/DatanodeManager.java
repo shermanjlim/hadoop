@@ -71,6 +71,7 @@ import dingo.DingoClient;
 import dingo.DeclarationProto;
 
 import java.time.Instant;
+import java.util.concurrent.ConcurrentHashMap;
 // ------------------ Dingo Integration ------------------
 
 import javax.annotation.Nonnull;
