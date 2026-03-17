@@ -43,6 +43,8 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   // ------------------ Dingo Integration ------------------
   public static final String  DFS_DINGO_SERVER_ADDRESS_KEY = "dfs.dingo.server.address";
   public static final String  DFS_DINGO_SERVER_ADDRESS_DEFAULT = "localhost:50051";
+  public static final String  DFS_DINGO_FS_METADATA_PORT_KEY = "dfs.dingo.fs-metadata.port";
+  public static final int     DFS_DINGO_FS_METADATA_PORT_DEFAULT = 50052;
 
   public static final String DECLARATIVE_SCRUBBING_DEADLINE_SECONDS_KEY =
       "declarative.scrubbing.deadline.seconds";

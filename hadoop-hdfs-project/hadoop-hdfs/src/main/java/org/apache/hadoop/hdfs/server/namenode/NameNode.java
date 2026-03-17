@@ -47,6 +47,9 @@ import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
 import org.apache.hadoop.hdfs.protocol.ClientProtocol;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.StoragePolicySatisfierMode;
+import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+import org.apache.hadoop.hdfs.protocol.LocatedBlock;
+import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
 import org.apache.hadoop.hdfs.server.aliasmap.InMemoryAliasMap;
 import org.apache.hadoop.hdfs.server.aliasmap.InMemoryLevelDBAliasMapServer;
@@ -102,6 +105,8 @@ import org.apache.hadoop.util.GcTimeMonitor;
 import org.apache.hadoop.util.GcTimeMonitor.Builder;
 import org.apache.hadoop.tracing.Tracer;
 import org.apache.hadoop.util.Timer;
+
+import dingo.FSMetadataServer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -483,6 +488,10 @@ public class NameNode extends ReconfigurableBase implements
   private ObjectName nameNodeStatusBeanName;
   protected final Tracer tracer;
   ScheduledThreadPoolExecutor metricsLoggerTimer;
+
+  // ------------------ Dingo Integration ------------------
+  private FSMetadataServer dingoFSMetadataServer;
+  // ------------------ Dingo Integration ------------------
 
   /**
    * The namenode address that clients will use to access this namenode
@@ -905,6 +914,7 @@ public class NameNode extends ReconfigurableBase implements
 
     loadNamesystem(conf);
     startAliasMapServerIfNecessary(conf);
+    startDingoFSMetadataServer(conf);
 
     rpcServer = createRpcServer(conf);
 
@@ -947,6 +957,49 @@ public class NameNode extends ReconfigurableBase implements
       levelDBAliasMapServer.start();
     }
   }
+
+  // ------------------ Dingo Integration ------------------
+  private void startDingoFSMetadataServer(Configuration conf)
+      throws IOException {
+    int port = conf.getInt(
+        DFSConfigKeys.DFS_DINGO_FS_METADATA_PORT_KEY,
+        DFSConfigKeys.DFS_DINGO_FS_METADATA_PORT_DEFAULT);
+    this.dingoFSMetadataServer = new FSMetadataServer(
+        port, this::translateFileSegment);
+    LOG.info("Dingo FSMetadataServer started on port {}", port);
+  }
+
+  private java.util.Set<dingo.Block> translateFileSegment(
+      dingo.FileSegment fileSegment, String clientIpAddr) {
+    try {
+      HdfsFileStatus stat = namesystem.getFileInfo(fileSegment.getPath(), true, false, false);
+      if (stat == null) {
+        throw new IOException("File not found: " + fileSegment.getPath());
+      }
+
+      LocatedBlocks locatedBlocks = namesystem.getBlockLocations(
+          clientIpAddr, fileSegment.getPath(),
+          fileSegment.getOffset(), fileSegment.getLength());
+
+      java.util.Set<dingo.Block> blockSet = new HashSet<>();
+      for (LocatedBlock lb : locatedBlocks.getLocatedBlocks()) {
+        long blockId = lb.getBlock().getBlockId();
+        // For replicated blocks, take only 1 location (the preferred replica).
+        // For striped (EC) blocks, take numDataUnits locations.
+        int maxLocations = lb.isStriped()
+            ? stat.getErasureCodingPolicy().getNumDataUnits() : 1;
+        for (int i = 0; i < maxLocations && i < lb.getLocations().length; i++) {
+          blockSet.add(new dingo.Block(
+              blockId, lb.getLocations()[i].getDatanodeUuid()));
+        }
+      }
+      return blockSet;
+    } catch (IOException e) {
+      throw new RuntimeException(
+          "Failed to get block locations for " + fileSegment.getPath(), e);
+    }
+  }
+  // ------------------ Dingo Integration ------------------
 
   private void initReconfigurableBackoffKey() {
     ipcClientRPCBackoffEnable = buildBackoffEnableKey(rpcServer
@@ -1043,6 +1096,16 @@ public class NameNode extends ReconfigurableBase implements
     if(rpcServer != null) rpcServer.stop();
     if(namesystem != null) namesystem.close();
     if (pauseMonitor != null) pauseMonitor.stop();
+    // ------------------ Dingo Integration ------------------
+    if (dingoFSMetadataServer != null) {
+      try {
+        dingoFSMetadataServer.close();
+        LOG.info("Dingo FSMetadataServer shutdown successfully");
+      } catch (Exception e) {
+        LOG.warn("Exception shutting down Dingo FSMetadataServer", e);
+      }
+    }
+    // ------------------ Dingo Integration ------------------
     if (plugins != null) {
       for (ServicePlugin p : plugins) {
         try {
@@ -1051,7 +1114,7 @@ public class NameNode extends ReconfigurableBase implements
           LOG.warn("ServicePlugin " + p + " could not be stopped", t);
         }
       }
-    }   
+    }
     stopHttpServer();
   }
   
